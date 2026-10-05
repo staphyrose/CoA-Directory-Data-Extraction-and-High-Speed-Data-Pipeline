@@ -1,4 +1,3 @@
-```python
 import time
 import logging
 from pathlib import Path
@@ -8,23 +7,33 @@ import requests
 
 from .config import *
 from .db import connect
-from .normalize import source_hash, clean, normalize_registration, normalize_phone
-from .parser import detect_captcha, discover_form, parse_records
+from .normalize import (
+    source_hash,
+    clean,
+    normalize_registration,
+    normalize_phone,
+)
+from .parser import (
+    detect_captcha,
+    discover_form,
+    parse_records,
+)
 
 
 # ============================================================
 # LOGGING
 # ============================================================
 
-# Make sure the logs directory exists before logging starts.
-# This is important for cloud deployment platforms such as Render.
+# Ensure the logs directory exists before Python creates
+# the pipeline log file. This is required for cloud hosting
+# platforms such as Render.
 LOG_DIR = Path(LOG_DIR)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     filename=LOG_DIR / "pipeline.log",
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
+    format="%(asctime)s %(levelname)s %(message)s",
 )
 
 logger = logging.getLogger(__name__)
@@ -39,7 +48,7 @@ class CoAExtractor:
     def __init__(self, delay=REQUEST_DELAY_SECONDS):
         self.delay = delay
 
-        # Create a reusable HTTP session.
+        # Reusable HTTP session
         self.session = requests.Session()
 
         self.session.headers.update({
@@ -52,44 +61,47 @@ class CoAExtractor:
 
     def fetch(self, url):
         """
-        Fetch a URL with retry handling.
+        Fetch a URL with retry and exponential backoff.
 
-        Retries are performed for:
-        - HTTP 429
-        - HTTP 500
-        - HTTP 502
-        - HTTP 503
-        - HTTP 504
-        - Network/request errors
-
-        Exponential backoff is used between attempts.
+        Retryable HTTP statuses:
+        429, 500, 502, 503, 504
         """
 
-        last = None
+        last_error = None
 
         for attempt in range(MAX_RETRIES):
 
             try:
+
                 logger.info(
                     "Request attempt %s/%s: %s",
                     attempt + 1,
                     MAX_RETRIES,
-                    url
-                )
-
-                r = self.session.get(
                     url,
-                    timeout=REQUEST_TIMEOUT
                 )
 
-                # Handle temporary/server/rate-limit responses.
-                if r.status_code in (429, 500, 502, 503, 504):
+                response = self.session.get(
+                    url,
+                    timeout=REQUEST_TIMEOUT,
+                )
 
-                    last = f"HTTP {r.status_code}"
+                # Handle rate limiting and temporary
+                # server-side errors.
+                if response.status_code in (
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                ):
+
+                    last_error = (
+                        f"HTTP {response.status_code}"
+                    )
 
                     logger.warning(
                         "Retryable HTTP response: %s",
-                        r.status_code
+                        response.status_code,
                     )
 
                     time.sleep(
@@ -98,22 +110,22 @@ class CoAExtractor:
 
                     continue
 
-                r.raise_for_status()
+                response.raise_for_status()
 
                 logger.info(
                     "Successful response: HTTP %s",
-                    r.status_code
+                    response.status_code,
                 )
 
-                return r
+                return response
 
-            except requests.RequestException as e:
+            except requests.RequestException as error:
 
-                last = str(e)
+                last_error = str(error)
 
                 logger.warning(
                     "Request error: %s",
-                    e
+                    error,
                 )
 
                 time.sleep(
@@ -121,11 +133,11 @@ class CoAExtractor:
                 )
 
         raise RuntimeError(
-            last or "request failed"
+            last_error or "Request failed"
         )
 
     # ========================================================
-    # CREATE JOB
+    # CREATE EXTRACTION JOB
     # ========================================================
 
     def create_job(self, category, query_value):
@@ -134,9 +146,9 @@ class CoAExtractor:
             timezone.utc
         ).isoformat()
 
-        with connect() as c:
+        with connect() as connection:
 
-            cur = c.execute(
+            cursor = connection.execute(
                 """
                 INSERT INTO extraction_jobs
                 (
@@ -153,23 +165,21 @@ class CoAExtractor:
                     query_value,
                     "running",
                     now,
-                    now
-                )
+                    now,
+                ),
             )
 
-            job_id = cur.lastrowid
+            job_id = cursor.lastrowid
 
         logger.info(
-            "Created extraction job %s: category=%s query=%s",
+            "Created extraction job %s",
             job_id,
-            category,
-            query_value
         )
 
         return job_id
 
     # ========================================================
-    # EVENT
+    # RECORD EXTRACTION EVENT
     # ========================================================
 
     def event(
@@ -178,16 +188,16 @@ class CoAExtractor:
         event_type,
         message,
         url=None,
-        http_status=None
+        http_status=None,
     ):
 
         now = datetime.now(
             timezone.utc
         ).isoformat()
 
-        with connect() as c:
+        with connect() as connection:
 
-            c.execute(
+            connection.execute(
                 """
                 INSERT INTO extraction_events
                 (
@@ -206,11 +216,11 @@ class CoAExtractor:
                     message,
                     url,
                     http_status,
-                    now
-                )
+                    now,
+                ),
             )
 
-            c.execute(
+            connection.execute(
                 """
                 UPDATE extraction_jobs
                 SET latest_activity=?
@@ -218,15 +228,15 @@ class CoAExtractor:
                 """,
                 (
                     now,
-                    job_id
-                )
+                    job_id,
+                ),
             )
 
         logger.info(
-            "Job %s event [%s]: %s",
+            "Job %s | %s | %s",
             job_id,
             event_type,
-            message
+            message,
         )
 
     # ========================================================
@@ -238,27 +248,31 @@ class CoAExtractor:
         job_id,
         records,
         source_type="directory",
-        scope="live_directory"
+        scope="live_directory",
     ):
 
         saved = 0
-        dup = 0
+        duplicates = 0
 
         now = datetime.now(
             timezone.utc
         ).isoformat()
 
-        with connect() as c:
+        with connect() as connection:
 
-            for rec in records:
+            for record in records:
 
-                reg = normalize_registration(
-                    rec.get("registration_number")
+                registration_number = (
+                    normalize_registration(
+                        record.get(
+                            "registration_number"
+                        )
+                    )
                 )
 
                 try:
 
-                    c.execute(
+                    connection.execute(
                         """
                         INSERT INTO architects
                         (
@@ -290,54 +304,70 @@ class CoAExtractor:
                         """,
                         (
                             clean(
-                                rec.get("architect_name")
+                                record.get(
+                                    "architect_name"
+                                )
                             ),
 
-                            rec.get(
+                            record.get(
                                 "architecture_id"
                             ),
 
-                            reg,
+                            registration_number,
 
-                            rec.get(
+                            record.get(
                                 "registration_year"
                             ),
 
                             clean(
-                                rec.get("address")
+                                record.get(
+                                    "address"
+                                )
                             ),
 
                             clean(
-                                rec.get("state")
+                                record.get(
+                                    "state"
+                                )
                             ),
 
                             clean(
-                                rec.get("city")
+                                record.get(
+                                    "city"
+                                )
                             ),
 
                             clean(
-                                rec.get("pincode")
+                                record.get(
+                                    "pincode"
+                                )
                             ),
 
                             normalize_phone(
-                                rec.get("phone")
+                                record.get(
+                                    "phone"
+                                )
                             ),
 
-                            rec.get("email"),
+                            record.get(
+                                "email"
+                            ),
 
                             clean(
-                                rec.get(
+                                record.get(
                                     "registration_status"
                                 )
                             ),
 
                             clean(
-                                rec.get("valid_upto")
+                                record.get(
+                                    "valid_upto"
+                                )
                             ),
 
-                            rec.get(
+                            record.get(
                                 "source_url",
-                                DIRECTORY_URL
+                                DIRECTORY_URL,
                             ),
 
                             source_type,
@@ -350,20 +380,25 @@ class CoAExtractor:
 
                             "unique",
 
-                            rec.get("raw_hash")
-                        )
+                            record.get(
+                                "raw_hash"
+                            ),
+                        ),
                     )
 
                     saved += 1
 
-                except Exception as e:
+                except Exception as error:
 
                     # Duplicate record
-                    if "UNIQUE constraint failed" in str(e):
+                    if (
+                        "UNIQUE constraint failed"
+                        in str(error)
+                    ):
 
-                        dup += 1
+                        duplicates += 1
 
-                        c.execute(
+                        connection.execute(
                             """
                             INSERT INTO extraction_events
                             (
@@ -378,19 +413,20 @@ class CoAExtractor:
                                 job_id,
                                 "duplicate",
                                 "Duplicate record skipped",
-                                now
-                            )
+                                now,
+                            ),
                         )
 
                         logger.info(
-                            "Duplicate record skipped for job %s",
-                            job_id
+                            "Duplicate record skipped "
+                            "for job %s",
+                            job_id,
                         )
 
                     # Other record-level error
                     else:
 
-                        c.execute(
+                        connection.execute(
                             """
                             INSERT INTO extraction_events
                             (
@@ -404,18 +440,18 @@ class CoAExtractor:
                             (
                                 job_id,
                                 "record_error",
-                                str(e),
-                                now
-                            )
+                                str(error),
+                                now,
+                            ),
                         )
 
                         logger.exception(
                             "Record error for job %s",
-                            job_id
+                            job_id,
                         )
 
-            # Update job counters.
-            c.execute(
+            # Update counters
+            connection.execute(
                 """
                 UPDATE extraction_jobs
                 SET
@@ -427,19 +463,20 @@ class CoAExtractor:
                 """,
                 (
                     saved,
-                    dup,
-                    job_id
-                )
+                    duplicates,
+                    job_id,
+                ),
             )
 
         logger.info(
-            "Job %s saved=%s duplicates=%s",
+            "Job %s completed record save: "
+            "saved=%s duplicates=%s",
             job_id,
             saved,
-            dup
+            duplicates,
         )
 
-        return saved, dup
+        return saved, duplicates
 
     # ========================================================
     # RUN CATEGORY PAGE
@@ -448,12 +485,12 @@ class CoAExtractor:
     def run_category_page(
         self,
         category,
-        query_value
+        query_value,
     ):
 
-        job = self.create_job(
+        job_id = self.create_job(
             category,
-            query_value
+            query_value,
         )
 
         url = (
@@ -469,18 +506,18 @@ class CoAExtractor:
         try:
 
             # ------------------------------------------------
-            # FETCH PAGE
+            # FETCH
             # ------------------------------------------------
 
-            r = self.fetch(url)
+            response = self.fetch(url)
 
             # ------------------------------------------------
             # STORE RAW RESPONSE
             # ------------------------------------------------
 
-            with connect() as c:
+            with connect() as connection:
 
-                c.execute(
+                connection.execute(
                     """
                     INSERT INTO raw_responses
                     (
@@ -494,22 +531,28 @@ class CoAExtractor:
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        job,
+                        job_id,
                         url,
-                        source_hash(r.text),
-                        r.status_code,
+                        source_hash(
+                            response.text
+                        ),
+                        response.status_code,
                         datetime.now(
                             timezone.utc
                         ).isoformat(),
-                        r.text[:200000]
-                    )
+                        response.text[
+                            :200000
+                        ],
+                    ),
                 )
 
             # ------------------------------------------------
             # CAPTCHA / SECURITY DETECTION
             # ------------------------------------------------
 
-            if detect_captcha(r.text):
+            if detect_captcha(
+                response.text
+            ):
 
                 message = (
                     "Security verification detected. "
@@ -518,16 +561,16 @@ class CoAExtractor:
                 )
 
                 self.event(
-                    job,
+                    job_id,
                     "captcha_required",
                     message,
                     url,
-                    r.status_code
+                    response.status_code,
                 )
 
-                with connect() as c:
+                with connect() as connection:
 
-                    c.execute(
+                    connection.execute(
                         """
                         UPDATE extraction_jobs
                         SET
@@ -538,20 +581,22 @@ class CoAExtractor:
                         """,
                         (
                             "captcha_required",
-                            job
-                        )
+                            job_id,
+                        ),
                     )
 
                 logger.warning(
-                    "CAPTCHA/security verification detected "
+                    "Security verification detected "
                     "for job %s. Extraction paused.",
-                    job
+                    job_id,
                 )
 
                 return {
-                    "job_id": job,
+                    "job_id": job_id,
                     "status": "captcha_required",
-                    "form": discover_form(r.text)
+                    "form": discover_form(
+                        response.text
+                    ),
                 }
 
             # ------------------------------------------------
@@ -559,26 +604,32 @@ class CoAExtractor:
             # ------------------------------------------------
 
             records = parse_records(
-                r.text,
-                url
+                response.text,
+                url,
             )
 
             # ------------------------------------------------
             # SAVE RECORDS
             # ------------------------------------------------
 
-            saved, dup = self.save_records(
-                job,
-                records
+            saved, duplicates = (
+                self.save_records(
+                    job_id,
+                    records,
+                )
             )
 
             # ------------------------------------------------
             # COMPLETE JOB
             # ------------------------------------------------
 
-            with connect() as c:
+            finished_at = datetime.now(
+                timezone.utc
+            ).isoformat()
 
-                c.execute(
+            with connect() as connection:
+
+                connection.execute(
                     """
                     UPDATE extraction_jobs
                     SET
@@ -590,49 +641,51 @@ class CoAExtractor:
                     (
                         "completed",
                         len(records),
-                        datetime.now(
-                            timezone.utc
-                        ).isoformat(),
-                        job
-                    )
+                        finished_at,
+                        job_id,
+                    ),
                 )
 
             logger.info(
                 "Job %s completed successfully. "
                 "Records=%s duplicates=%s",
-                job,
+                job_id,
                 saved,
-                dup
+                duplicates,
             )
 
             return {
-                "job_id": job,
+                "job_id": job_id,
                 "status": "completed",
                 "records": saved,
-                "duplicates": dup
+                "duplicates": duplicates,
             }
 
         # ----------------------------------------------------
         # ERROR HANDLING
         # ----------------------------------------------------
 
-        except Exception as e:
+        except Exception as error:
 
             logger.exception(
                 "Job %s failed",
-                job
+                job_id,
             )
 
             self.event(
-                job,
+                job_id,
                 "http_error",
-                str(e),
-                url
+                str(error),
+                url,
             )
 
-            with connect() as c:
+            finished_at = datetime.now(
+                timezone.utc
+            ).isoformat()
 
-                c.execute(
+            with connect() as connection:
+
+                connection.execute(
                     """
                     UPDATE extraction_jobs
                     SET
@@ -643,55 +696,14 @@ class CoAExtractor:
                     """,
                     (
                         "failed",
-                        str(e),
-                        datetime.now(
-                            timezone.utc
-                        ).isoformat(),
-                        job
-                    )
+                        str(error),
+                        finished_at,
+                        job_id,
+                    ),
                 )
 
             return {
-                "job_id": job,
+                "job_id": job_id,
                 "status": "failed",
-                "error": str(e)
+                "error": str(error),
             }
-```
-
-### Now do this
-
-After replacing the file:
-
-1. Save `extractor.py`.
-2. Upload/commit the changed file to GitHub.
-3. Go to **Render → your service → Events**.
-4. Render should automatically start a new deployment.
-5. Wait for **Live**.
-
-The important fix is these two lines:
-
-```python
-LOG_DIR = Path(LOG_DIR)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-```
-
-That ensures Render creates:
-
-```text
-logs/
-└── pipeline.log
-```
-
-automatically instead of crashing with:
-
-```text
-FileNotFoundError: No such file or directory: '/opt/render/project/src/logs/pipeline.log'
-```
-
-Also, I noticed your original file uses `normalize_phone(...)` but the import line you pasted does **not** import it. I've corrected that too:
-
-```python
-from .normalize import source_hash, clean, normalize_registration, normalize_phone
-```
-
-So use the **whole file above**, not just the two-line fix.
